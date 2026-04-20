@@ -9,13 +9,14 @@ The point: **sovBrain never sees your provider API key.** It signs every request
 | Runtime | Status | Directory |
 |---------|--------|-----------|
 | Cloudflare Workers | Stable | [`cloudflare/`](./cloudflare/) |
-| Node.js | Planned | — |
+| Docker (Node 20) | Stable | [`docker/`](./docker/) |
 | Deno | Planned | — |
-| Docker | Planned | — |
 
 Pick whichever runtime you prefer. They all implement the same wire protocol — sovBrain doesn't care which one you use.
 
-## Quick start (Cloudflare)
+## Quick start
+
+### Cloudflare Workers
 
 ```bash
 git clone https://github.com/incubiq/sovbrain-proxies.git
@@ -23,6 +24,17 @@ cd sovbrain-proxies/cloudflare
 npm install
 npx wrangler login
 # Follow the README in cloudflare/ for the rest
+```
+
+### Docker
+
+```bash
+git clone https://github.com/incubiq/sovbrain-proxies.git
+cd sovbrain-proxies/docker
+cp .env.example .env
+# Edit .env with your secrets
+docker compose up -d
+curl http://localhost:8787/health   # -> "ok"
 ```
 
 For a step-by-step guide you can feed to Claude Code or any AI coding assistant, sovBrain Sovereign-tier users can download `sovbrain-byo-proxy-setup.md` from their Settings page.
