@@ -14,13 +14,21 @@ A Cloudflare Worker that lets you hold your own AI provider credentials while ac
 npm install
 ```
 
-**2. Create the KV namespace for nonce deduplication**
+**2. Create your local `wrangler.toml`**
+
+The repo ships a template `wrangler.toml.example` but does not commit `wrangler.toml` itself (the real file holds a KV namespace id tied to the deployer's Cloudflare account, so it's git-ignored). Make a local copy:
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
+
+**3. Create the KV namespace for nonce deduplication**
 
 ```bash
 npx wrangler kv namespace create NONCE_CACHE
 ```
 
-Copy the `id` from the output and paste it into `wrangler.toml`:
+Copy the `id` from the output and paste it into your local `wrangler.toml`:
 
 ```toml
 [[kv_namespaces]]
@@ -28,7 +36,7 @@ binding = "NONCE_CACHE"
 id = "abc123..."   # <-- paste here
 ```
 
-**3. Set secrets**
+**4. Set secrets**
 
 ```bash
 npx wrangler secret put SOVBRAIN_PUBLIC_KEY    --config wrangler.toml
@@ -43,7 +51,7 @@ Values:
 - `PROVIDER_UPSTREAM_URL` — e.g. `https://api.openai.com`
 - `PROVIDER_API_KEY` — your upstream provider API key (OpenAI / Anthropic / etc.)
 
-**4. Deploy**
+**5. Deploy**
 
 ```bash
 npx wrangler deploy --config wrangler.toml

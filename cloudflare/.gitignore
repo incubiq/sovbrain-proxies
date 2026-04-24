@@ -2,3 +2,8 @@ node_modules/
 .wrangler/
 dist/
 .dev.vars
+
+# Local deployment config — starts from wrangler.toml.example and holds the
+# KV namespace id bound to the deployer's Cloudflare account. Kept out of
+# source control so forks/clones don't inherit someone else's ids.
+wrangler.toml
