@@ -238,10 +238,23 @@ async function forwardChatToUpstream(
     );
   }
 
-  // Pass response (including SSE body stream) through unchanged
+  // Forward the upstream body stream, but strip transport-layer headers
+  // that only describe the upstream→Worker hop. `fetch()` has already
+  // de-chunked the HTTP/1.1 chunked body and decompressed gzip/br, so
+  // leaving those headers in place makes the Worker's outgoing response
+  // framing inconsistent with the body bytes — on streaming responses
+  // this leaks chunk-size markers (e.g. `\r\n1000\r\n`) and bare `\n`
+  // buffer flushes into the SSE body, corrupting JSON payloads at 4KB
+  // boundaries. Observed with Ollama upstream.
+  const forwardHeaders = new Headers(upstream.headers);
+  forwardHeaders.delete("Transfer-Encoding");
+  forwardHeaders.delete("Content-Encoding");
+  forwardHeaders.delete("Content-Length");
+  forwardHeaders.delete("Connection");
+
   return new Response(upstream.body, {
     status: upstream.status,
-    headers: upstream.headers,
+    headers: forwardHeaders,
   });
 }
 
