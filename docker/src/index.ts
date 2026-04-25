@@ -8,9 +8,19 @@
  * Environment variables (read at startup):
  *   SOVBRAIN_PUBLIC_KEY    — base64 Ed25519 public key from sovBrain
  *   SOVBRAIN_USER_ID       — userId (UUID) this key belongs to
+ *
+ * Multi-upstream mode (preferred — set whichever upstreams you want):
+ *   ANTHROPIC_API_KEY      — your Anthropic API key (sk-ant-...)
+ *   OPENAI_API_KEY         — your OpenAI API key (sk-...)
+ *   OLLAMA_URL             — your Ollama base URL (no trailing slash)
+ *   OLLAMA_API_KEY         — optional Bearer token for hosted/gatewayed Ollama
+ *   DEFAULT_UPSTREAM       — optional: "anthropic" | "openai" | "ollama"
+ *
+ * Legacy single-upstream mode (back-compat):
  *   PROVIDER_UPSTREAM_URL  — upstream provider base URL (no trailing slash)
  *   PROVIDER_API_KEY       — provider API key (never leaves this container)
- *   PORT                   — listen port (default 8787)
+ *
+ * PORT                     — listen port (default 8787)
  *
  * Nonce cache is in-memory. For multi-replica deployments, replace
  * NonceStore with a Redis-backed implementation (see README).
@@ -19,6 +29,7 @@
 import http from "node:http";
 import { webcrypto } from "node:crypto";
 import { Readable } from "node:stream";
+import { buildUpstreamConfig, dispatchChatMulti, dispatchModelsMulti } from "./multi-upstream.js";
 
 const CHAT_PATH = "/v1/chat/completions";
 const MODELS_PATH = "/v1/models";
@@ -27,29 +38,68 @@ const TIMESTAMP_WINDOW_SECONDS = 300; // ±5 minutes
 const NONCE_TTL_SECONDS = 600; // 10 minutes
 
 // ---------------------------------------------------------------------------
-// Config — read once at startup, fail fast if missing
+// Env shape — mirrors cloudflare's Env interface (without KV, which is Node's
+// in-memory NonceStore instead)
 // ---------------------------------------------------------------------------
 
-interface Config {
-  publicKey: string;
-  userId: string;
-  upstreamUrl: string;
-  apiKey: string;
+export interface Env {
+  SOVBRAIN_PUBLIC_KEY: string;
+  SOVBRAIN_USER_ID: string;
+
+  // Multi-upstream (preferred)
+  ANTHROPIC_API_KEY?: string;
+  OPENAI_API_KEY?: string;
+  OLLAMA_URL?: string;
+  OLLAMA_API_KEY?: string; // optional — Bearer token for hosted/gatewayed Ollama
+  DEFAULT_UPSTREAM?: string; // "anthropic" | "openai" | "ollama" — validated at runtime
+
+  // Legacy single-upstream (back-compat)
+  PROVIDER_UPSTREAM_URL?: string;
+  PROVIDER_API_KEY?: string;
+}
+
+interface RuntimeConfig {
+  env: Env;
   port: number;
 }
 
-function loadConfig(): Config {
-  const required = ["SOVBRAIN_PUBLIC_KEY", "SOVBRAIN_USER_ID", "PROVIDER_UPSTREAM_URL", "PROVIDER_API_KEY"];
-  const missing = required.filter((k) => !process.env[k]);
+// ---------------------------------------------------------------------------
+// Config — read once at startup, fail fast if missing
+// ---------------------------------------------------------------------------
+
+function loadConfig(): RuntimeConfig {
+  const requiredCore = ["SOVBRAIN_PUBLIC_KEY", "SOVBRAIN_USER_ID"];
+  const missing = requiredCore.filter((k) => !process.env[k]);
   if (missing.length > 0) {
     console.error(`[fatal] missing required env vars: ${missing.join(", ")}`);
     process.exit(1);
   }
+
+  const env: Env = {
+    SOVBRAIN_PUBLIC_KEY: process.env.SOVBRAIN_PUBLIC_KEY!,
+    SOVBRAIN_USER_ID: process.env.SOVBRAIN_USER_ID!,
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OLLAMA_URL: process.env.OLLAMA_URL,
+    OLLAMA_API_KEY: process.env.OLLAMA_API_KEY,
+    DEFAULT_UPSTREAM: process.env.DEFAULT_UPSTREAM,
+    PROVIDER_UPSTREAM_URL: process.env.PROVIDER_UPSTREAM_URL,
+    PROVIDER_API_KEY: process.env.PROVIDER_API_KEY,
+  };
+
+  const hasMulti = !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.OLLAMA_URL);
+  const hasLegacy = !!(env.PROVIDER_UPSTREAM_URL && env.PROVIDER_API_KEY);
+  if (!hasMulti && !hasLegacy) {
+    console.error(
+      "[fatal] no upstream configured. Set one of:\n" +
+      "  - Multi-upstream: ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_URL\n" +
+      "  - Legacy: PROVIDER_UPSTREAM_URL + PROVIDER_API_KEY"
+    );
+    process.exit(1);
+  }
+
   return {
-    publicKey: process.env.SOVBRAIN_PUBLIC_KEY!,
-    userId: process.env.SOVBRAIN_USER_ID!,
-    upstreamUrl: process.env.PROVIDER_UPSTREAM_URL!.replace(/\/$/, ""),
-    apiKey: process.env.PROVIDER_API_KEY!,
+    env,
     port: parseInt(process.env.PORT ?? "8787", 10),
   };
 }
@@ -103,8 +153,13 @@ const server = http.createServer((req, res) => {
 setInterval(() => nonceStore.sweep(), 60_000).unref();
 
 server.listen(config.port, () => {
+  const cfg = buildUpstreamConfig(config.env);
+  const upstreams: string[] = [];
+  if (cfg.anthropic) upstreams.push("anthropic");
+  if (cfg.openai) upstreams.push("openai");
+  if (cfg.ollama) upstreams.push(`ollama (${cfg.ollama.baseUrl})`);
   console.log(`[ready] sovbrain-proxy listening on port ${config.port}`);
-  console.log(`[ready] forwarding to ${config.upstreamUrl}`);
+  console.log(`[ready] upstreams: ${upstreams.join(", ")}${cfg.default ? ` (default: ${cfg.default})` : ""}`);
 });
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -145,7 +200,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   }
 
   // --- 3. UserId check ---
-  if (userId !== config.userId) {
+  if (userId !== config.env.SOVBRAIN_USER_ID) {
     sendError(res, 401, "signature_invalid", "Ed25519 signature verification failed");
     return;
   }
@@ -169,7 +224,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
   // --- 7. Ed25519 signature verification ---
   const sigOk = await verifySignature(
-    config.publicKey,
+    config.env.SOVBRAIN_PUBLIC_KEY,
     signature,
     method,
     url.pathname,
@@ -183,11 +238,41 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   }
 
   // --- 8. Dispatch to upstream ---
-  if (isModels) {
-    await forwardModels(res);
+  const cfg = buildUpstreamConfig(config.env);
+
+  if (!cfg.anthropic && !cfg.openai && !cfg.ollama) {
+    sendError(res, 500, "no_upstream_configured", "No upstream is configured. Set ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_URL, or the legacy PROVIDER_UPSTREAM_URL + PROVIDER_API_KEY.");
     return;
   }
-  await forwardChat(res, body);
+
+  const response = isModels
+    ? await dispatchModelsMulti(cfg)
+    : await dispatchChatMulti(cfg, body);
+  await sendResponse(res, response);
+}
+
+// ---------------------------------------------------------------------------
+// Response adapter — Web Response → http.ServerResponse
+// ---------------------------------------------------------------------------
+
+async function sendResponse(res: http.ServerResponse, response: Response): Promise<void> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    // Skip transfer-encoding — Node sets it automatically when chunked.
+    // Skip content-length on streamed bodies (we don't know it ahead of time).
+    if (key.toLowerCase() === "transfer-encoding") return;
+    headers[key] = value;
+  });
+  res.writeHead(response.status, headers);
+
+  if (response.body) {
+    // Readable.fromWeb pipes the Web ReadableStream to the Node response.
+    // The `as any` is because @types/node's typing for this argument is
+    // overly narrow vs what Node 20 actually accepts.
+    Readable.fromWeb(response.body as any).pipe(res);
+  } else {
+    res.end();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,98 +344,10 @@ async function sha256Hex(text: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Upstream forwarding
-// ---------------------------------------------------------------------------
-
-function upstreamAuthHeaders(): Record<string, string> {
-  if (config.upstreamUrl.includes("anthropic.com")) {
-    return { "x-api-key": config.apiKey, "anthropic-version": "2023-06-01" };
-  }
-  return { Authorization: `Bearer ${config.apiKey}` };
-}
-
-async function forwardChat(res: http.ServerResponse, body: string): Promise<void> {
-  let upstream: Response;
-  try {
-    upstream = await fetch(`${config.upstreamUrl}${CHAT_PATH}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...upstreamAuthHeaders() },
-      body,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Network error reaching upstream";
-    sendError(res, 502, "upstream_error", `Provider unreachable: ${message}`);
-    return;
-  }
-
-  if (!upstream.ok) {
-    await upstream.text();
-    sendErrorWithUpstream(res, 502, "upstream_error", `Provider returned HTTP ${upstream.status}`, upstream.status);
-    return;
-  }
-
-  // Pipe streaming body (SSE-friendly) through unchanged.
-  const headers: Record<string, string> = {};
-  upstream.headers.forEach((value, key) => {
-    // Skip transfer-encoding — Node sets it automatically when chunked
-    if (key.toLowerCase() === "transfer-encoding") return;
-    headers[key] = value;
-  });
-  res.writeHead(upstream.status, headers);
-
-  if (upstream.body) {
-    Readable.fromWeb(upstream.body as any).pipe(res);
-  } else {
-    res.end();
-  }
-}
-
-async function forwardModels(res: http.ServerResponse): Promise<void> {
-  let upstream: Response;
-  try {
-    upstream = await fetch(`${config.upstreamUrl}${MODELS_PATH}`, {
-      method: "GET",
-      headers: upstreamAuthHeaders(),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Network error reaching upstream";
-    sendError(res, 502, "upstream_error", `Provider unreachable: ${message}`);
-    return;
-  }
-
-  if (!upstream.ok) {
-    await upstream.text();
-    sendErrorWithUpstream(
-      res,
-      502,
-      "upstream_error",
-      `Provider returned HTTP ${upstream.status} on /v1/models`,
-      upstream.status
-    );
-    return;
-  }
-
-  const payload = await upstream.text();
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(payload);
-}
-
-// ---------------------------------------------------------------------------
-// Error helpers
+// Error helper
 // ---------------------------------------------------------------------------
 
 function sendError(res: http.ServerResponse, status: number, code: string, message: string): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: { code, message } }));
-}
-
-function sendErrorWithUpstream(
-  res: http.ServerResponse,
-  status: number,
-  code: string,
-  message: string,
-  upstreamStatus: number
-): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: { code, message, upstream_status: upstreamStatus } }));
 }

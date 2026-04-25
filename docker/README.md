@@ -14,16 +14,18 @@ Same wire protocol as the [`cloudflare/`](../cloudflare/) variant — pick which
 
 - Docker 20.10+ (or Docker Desktop / Podman / any OCI runtime)
 - A Sovereign-tier sovBrain account
-- An API key from an upstream provider (OpenAI, Anthropic, together.ai, Ollama, vLLM, ...)
+- At least one upstream configured: an Anthropic API key, OpenAI API key, or an Ollama server URL
 
 ## Quick start
+
+Multi-upstream — set whichever upstreams you want. You don't need all three; any combination works.
 
 ```bash
 git clone https://github.com/incubiq/sovbrain-proxies.git
 cd sovbrain-proxies/docker
 
 cp .env.example .env
-# Edit .env — fill in the four secrets (see below)
+# Edit .env — fill in SOVBRAIN_PUBLIC_KEY, SOVBRAIN_USER_ID, and at least one upstream
 
 docker compose up -d
 curl http://localhost:8787/health   # -> "ok"
@@ -31,25 +33,30 @@ curl http://localhost:8787/health   # -> "ok"
 
 ## Environment variables
 
-| Variable | Description | Where to get it |
-|----------|-------------|-----------------|
-| `SOVBRAIN_PUBLIC_KEY` | Base64 Ed25519 public key | sovBrain Settings → External AI → Step 1 ("Generate signing key") |
-| `SOVBRAIN_USER_ID` | Your sovBrain user ID (UUID) | Same Step 1 card |
-| `PROVIDER_UPSTREAM_URL` | Upstream provider base URL, no trailing slash | Provider docs (see table below) |
-| `PROVIDER_API_KEY` | Upstream provider API key | Provider dashboard |
-| `PORT` | Listen port (default `8787`) | Optional |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SOVBRAIN_PUBLIC_KEY` | Yes | Base64 Ed25519 public key from sovBrain Settings → External AI |
+| `SOVBRAIN_USER_ID` | Yes | Your sovBrain user ID (UUID) |
+| `ANTHROPIC_API_KEY` | Optional* | Anthropic API key (`sk-ant-...`). Container translates OpenAI ↔ Anthropic Messages API automatically. |
+| `OPENAI_API_KEY` | Optional* | OpenAI API key (`sk-...`). |
+| `OLLAMA_URL` | Optional* | Base URL of your Ollama server (no trailing slash). |
+| `OLLAMA_API_KEY` | Optional | Bearer token for hosted/gatewayed Ollama (Ollama Cloud, Tailscale Funnel, custom reverse proxy). Omit for local/private Ollama with no auth. |
+| `DEFAULT_UPSTREAM` | Optional | `anthropic`, `openai`, or `ollama`. Routes unprefixed model names. Required only when multiple upstreams are configured. |
+| `PROVIDER_UPSTREAM_URL` | Legacy | Single-upstream fallback (only used if no multi-upstream var is set). |
+| `PROVIDER_API_KEY` | Legacy | Single-upstream fallback API key. |
+| `PORT` | Optional | Listen port (default `8787`) |
 
-Common upstream URLs:
+*At least one upstream (Anthropic / OpenAI / Ollama) must be configured. The legacy vars count as a fallback configuration.
 
-| Provider | URL |
-|----------|-----|
-| OpenAI | `https://api.openai.com` |
-| Anthropic | `https://api.anthropic.com` |
-| together.ai | `https://api.together.xyz` |
-| Ollama (host network) | `http://host.docker.internal:11434` |
-| vLLM (same compose network) | `http://vllm:8000` |
+Example upstream URLs for `OLLAMA_URL`:
 
-The Worker auto-detects Anthropic by hostname and switches to `x-api-key` + `anthropic-version` headers; everything else uses `Authorization: Bearer …` (OpenAI convention).
+| Deployment | URL |
+|------------|-----|
+| Local Ollama (Docker Desktop) | `http://host.docker.internal:11434` |
+| Ollama on the same compose network | `http://ollama:11434` |
+| Hosted Ollama gateway | `https://ai.example.com` |
+
+The container picks the correct auth scheme per upstream — `x-api-key` + `anthropic-version` for Anthropic, `Authorization: Bearer` for OpenAI and Ollama.
 
 ## Connecting to sovBrain
 
@@ -96,7 +103,7 @@ Caddy auto-issues a Let's Encrypt cert; sovBrain talks to `https://ai.example.co
 
 ```bash
 fly launch --no-deploy
-fly secrets set SOVBRAIN_PUBLIC_KEY=... SOVBRAIN_USER_ID=... PROVIDER_UPSTREAM_URL=... PROVIDER_API_KEY=...
+fly secrets set SOVBRAIN_PUBLIC_KEY=... SOVBRAIN_USER_ID=... ANTHROPIC_API_KEY=...
 fly deploy
 ```
 
@@ -110,6 +117,43 @@ Container is stateless aside from the in-memory nonce cache. For multi-replica:
 - OR replace `NonceStore` in `src/index.ts` with a Redis-backed implementation (use `SET key 1 EX 600 NX` for atomic check-and-store)
 
 A single replica handles thousands of req/s and many concurrent users — scale only when you hit a real bottleneck.
+
+## Upstream routing
+
+The container routes requests based on a prefix in the model name (split on the first colon):
+
+| Model sent by sovBrain | Routed to |
+|------------------------|-----------|
+| `anthropic:claude-haiku-4-5-20251001` | Anthropic Messages API (with translation) |
+| `openai:gpt-4o` | OpenAI `/v1/chat/completions` |
+| `ollama:qwen3:32b` | Ollama `/v1/chat/completions` |
+| `gpt-4o` (no prefix) | Default upstream (if `DEFAULT_UPSTREAM` set or only one upstream configured) |
+
+**Dispatch rules:**
+
+1. If the model string starts with a recognised prefix (`anthropic:`, `openai:`, `ollama:`), the prefix is stripped and the request is forwarded to that upstream. Returns `400 upstream_not_configured` if that upstream has no credentials.
+2. If there is no recognised prefix, the full model string is passed as-is to the default upstream (set via `DEFAULT_UPSTREAM`) or to the sole configured upstream.
+3. If multiple upstreams are configured with no `DEFAULT_UPSTREAM` and no prefix, returns `400 ambiguous_model`.
+
+**Examples:**
+
+Anthropic only (`ANTHROPIC_API_KEY=sk-ant-...`):
+```
+sovBrain sends:  anthropic:claude-haiku-4-5-20251001
+Container:       translates OpenAI → Anthropic Messages, streams OpenAI deltas back
+```
+
+Anthropic + Ollama (`ANTHROPIC_API_KEY=...`, `OLLAMA_URL=http://ollama:11434`, `DEFAULT_UPSTREAM=anthropic`):
+```
+sovBrain sends:  anthropic:claude-haiku-4-5-20251001  → Anthropic
+sovBrain sends:  ollama:qwen3:32b                     → Ollama
+sovBrain sends:  claude-haiku-4-5-20251001            → Anthropic (default)
+```
+
+Migrating from legacy single-upstream (`PROVIDER_UPSTREAM_URL=https://api.openai.com`, `PROVIDER_API_KEY=sk-...`):
+- No change needed. The container detects no multi-upstream vars and falls back to the legacy config automatically.
+- The startup banner will show `upstreams: openai (default: openai)`.
+- Once you're ready, set `OPENAI_API_KEY` directly and remove the legacy vars.
 
 ## Updating the public key (rotation)
 
@@ -143,7 +187,7 @@ docker compose logs -f sovbrain-proxy
 ```
 
 The proxy logs:
-- Startup banner with port and upstream URL
+- Startup banner with port and configured upstreams
 - Unhandled errors only
 
 It does **not** log signature failures, nonce reuses, or upstream errors by default — those are surfaced to sovBrain in the response body. If you want verbose logs for debugging, add `console.log` calls in `src/index.ts` and rebuild.
@@ -155,8 +199,12 @@ It does **not** log signature failures, nonce reuses, or upstream errors by defa
 | `signature_invalid` (401) | `SOVBRAIN_PUBLIC_KEY` doesn't match sovBrain's current key | Re-paste from sovBrain Settings → External AI |
 | `signature_expired` (401) | Container clock drift (>5 min from sovBrain) | Sync clocks (NTP). Common on long-running VMs that hibernated |
 | `nonce_reused` (409) | sovBrain re-sent the same nonce, OR you're running multiple replicas without shared nonce store | Single replica is fine; multi-replica needs Redis-backed `NonceStore` |
-| `upstream_error` (502) | Provider unreachable or returned non-2xx | Check `PROVIDER_UPSTREAM_URL` and `PROVIDER_API_KEY`; test the provider directly with curl |
+| `upstream_error` (502) | Provider unreachable or returned non-2xx | Check the matching upstream's secret(s); test the provider directly with curl |
+| `ambiguous_model` (400) | Multiple upstreams configured, unprefixed model name | Set `DEFAULT_UPSTREAM` env var, or use a prefixed model name (`anthropic:`, `openai:`, `ollama:`) |
+| `upstream_not_configured` (400) | Model prefix references an upstream you didn't configure | Set the matching `*_API_KEY` / URL var, or use a different prefix |
+| `no_upstream_configured` (500) | No upstream secrets configured at all | Set at least one of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_URL` (or the legacy `PROVIDER_*` pair) |
 | Container won't start, exits with `[fatal] missing required env vars: …` | `.env` not loaded | Verify `.env` exists; `docker compose --env-file` if non-default location |
+| Container won't start, exits with `[fatal] no upstream configured` | No upstream vars set | Set at least one upstream in `.env` |
 | Local Ollama not reachable from container | Default Docker bridge can't see host | Use `http://host.docker.internal:11434` (Docker Desktop) or `--network=host` (Linux) |
 
 ## Security notes
@@ -164,7 +212,7 @@ It does **not** log signature failures, nonce reuses, or upstream errors by defa
 - The container runs as a non-root user (`sovbrain:sovbrain`)
 - No third-party runtime dependencies — only Node 20's standard library
 - The image is ~50MB (alpine + node) with zero `node_modules` shipped
-- Audit surface: `src/index.ts` is ~270 lines. Read it before deploying.
+- Audit surface: four source files — `anthropic-translator.ts` (~240 lines), `dispatchers.ts` (~220 lines), `multi-upstream.ts` (~230 lines), `index.ts` (~230 lines). Read them before deploying.
 
 ## License
 
