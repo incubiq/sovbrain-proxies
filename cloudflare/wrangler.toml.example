@@ -21,10 +21,32 @@ id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 # ---------------------------------------------------------------------------
 # Secrets — set via `wrangler secret put <NAME>` (never commit these values)
 #
-#   npx wrangler secret put SOVBRAIN_PUBLIC_KEY    --config wrangler.toml
-#   npx wrangler secret put SOVBRAIN_USER_ID       --config wrangler.toml
-#   npx wrangler secret put PROVIDER_UPSTREAM_URL  --config wrangler.toml
-#   npx wrangler secret put PROVIDER_API_KEY       --config wrangler.toml
+# Required (always):
+#   SOVBRAIN_PUBLIC_KEY    — base64 Ed25519 public key from sovBrain
+#   SOVBRAIN_USER_ID       — your sovBrain userId UUID
+#
+# Multi-upstream mode (preferred — set whichever upstreams you want):
+#   ANTHROPIC_API_KEY      — your Anthropic API key (sk-ant-...)
+#   OPENAI_API_KEY         — your OpenAI API key (sk-...)
+#   OLLAMA_URL             — your Ollama base URL (no trailing slash)
+#   OLLAMA_API_KEY         — optional Bearer token for hosted/gatewayed Ollama
+#                            (Ollama Cloud, Tailscale Funnel with auth, custom
+#                            reverse proxy with token gating, etc.). Omit for
+#                            true local/private Ollama with no auth.
+#   DEFAULT_UPSTREAM       — optional: "anthropic" | "openai" | "ollama".
+#                            Used when sovBrain sends a model with no prefix.
+#                            If unset and multiple upstreams configured,
+#                            unprefixed models return 400 ambiguous_model.
+#
+# Legacy single-upstream mode (back-compat — only used if NO multi-upstream
+# var is set above):
+#   PROVIDER_UPSTREAM_URL  — full base URL (no trailing slash)
+#   PROVIDER_API_KEY       — your provider API key
+#
+# Examples:
+#   npx wrangler secret put ANTHROPIC_API_KEY  --config wrangler.toml
+#   npx wrangler secret put OLLAMA_URL         --config wrangler.toml
+#   npx wrangler secret put DEFAULT_UPSTREAM   --config wrangler.toml
 #
 # For local development you can put the values in a .dev.vars file
 # (see .gitignore — that file is excluded from source control).

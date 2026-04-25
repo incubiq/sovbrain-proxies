@@ -1,3 +1,6 @@
+import { errorResponse } from "./dispatchers";
+import { buildUpstreamConfig, dispatchChatMulti, dispatchModelsMulti } from "./multi-upstream";
+
 /**
  * sovBrain BYO AI Proxy — Cloudflare Worker reference implementation
  *
@@ -7,6 +10,15 @@
  * Environment variables (set via `wrangler secret put`):
  *   SOVBRAIN_PUBLIC_KEY    — base64 Ed25519 public key from sovBrain
  *   SOVBRAIN_USER_ID       — userId (UUID) this key belongs to
+ *
+ * Multi-upstream mode (preferred — set whichever upstreams you want):
+ *   ANTHROPIC_API_KEY      — your Anthropic API key (sk-ant-...)
+ *   OPENAI_API_KEY         — your OpenAI API key (sk-...)
+ *   OLLAMA_URL             — your Ollama base URL (no trailing slash)
+ *   OLLAMA_API_KEY         — optional Bearer token for hosted/gatewayed Ollama
+ *   DEFAULT_UPSTREAM       — optional: "anthropic" | "openai" | "ollama"
+ *
+ * Legacy single-upstream mode (back-compat):
  *   PROVIDER_UPSTREAM_URL  — upstream provider base URL (no trailing slash)
  *   PROVIDER_API_KEY       — provider API key (never leaves this Worker)
  *
@@ -17,8 +29,18 @@
 export interface Env {
   SOVBRAIN_PUBLIC_KEY: string;
   SOVBRAIN_USER_ID: string;
-  PROVIDER_UPSTREAM_URL: string;
-  PROVIDER_API_KEY: string;
+
+  // Multi-upstream (preferred)
+  ANTHROPIC_API_KEY?: string;
+  OPENAI_API_KEY?: string;
+  OLLAMA_URL?: string;
+  OLLAMA_API_KEY?: string; // optional — Bearer token for hosted/gatewayed Ollama
+  DEFAULT_UPSTREAM?: string; // "anthropic" | "openai" | "ollama" — validated at runtime
+
+  // Legacy single-upstream (back-compat)
+  PROVIDER_UPSTREAM_URL?: string;
+  PROVIDER_API_KEY?: string;
+
   NONCE_CACHE: KVNamespace;
 }
 
@@ -100,10 +122,19 @@ export default {
     }
 
     // --- 8. Dispatch to upstream ---
-    if (isModels) {
-      return forwardModelsToUpstream(env.PROVIDER_UPSTREAM_URL, env.PROVIDER_API_KEY);
+    const cfg = buildUpstreamConfig(env);
+    if (!cfg.anthropic && !cfg.openai && !cfg.ollama) {
+      return errorResponse(
+        500,
+        "no_upstream_configured",
+        "No upstream is configured. Set ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_URL, or the legacy PROVIDER_UPSTREAM_URL + PROVIDER_API_KEY."
+      );
     }
-    return forwardChatToUpstream(env.PROVIDER_UPSTREAM_URL, env.PROVIDER_API_KEY, body);
+
+    if (isModels) {
+      return dispatchModelsMulti(cfg);
+    }
+    return dispatchChatMulti(cfg, body);
   },
 };
 
@@ -189,109 +220,6 @@ async function verifySignature(
 }
 
 // ---------------------------------------------------------------------------
-// Upstream forwarding
-// ---------------------------------------------------------------------------
-
-/**
- * Pick upstream auth headers based on URL. Anthropic uses `x-api-key`;
- * everyone else (OpenAI, Ollama, together.ai, vLLM...) uses Bearer tokens.
- */
-function upstreamAuthHeaders(upstreamBaseUrl: string, apiKey: string): Record<string, string> {
-  if (upstreamBaseUrl.includes("anthropic.com")) {
-    return {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    };
-  }
-  return { Authorization: `Bearer ${apiKey}` };
-}
-
-async function forwardChatToUpstream(
-  upstreamBaseUrl: string,
-  apiKey: string,
-  body: string
-): Promise<Response> {
-  let upstream: Response;
-
-  try {
-    upstream = await fetch(`${upstreamBaseUrl}${CHAT_PATH}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...upstreamAuthHeaders(upstreamBaseUrl, apiKey),
-      },
-      body,
-    });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Network error reaching upstream";
-    return errorResponse(502, "upstream_error", `Provider unreachable: ${message}`);
-  }
-
-  // Non-2xx upstream: wrap in upstream_error so sovBrain can surface it
-  if (!upstream.ok) {
-    await upstream.text();
-    return errorResponseWithUpstream(
-      502,
-      "upstream_error",
-      `Provider returned HTTP ${upstream.status}`,
-      upstream.status
-    );
-  }
-
-  // Forward the upstream body stream, but strip transport-layer headers
-  // that only describe the upstream→Worker hop. `fetch()` has already
-  // de-chunked the HTTP/1.1 chunked body and decompressed gzip/br, so
-  // leaving those headers in place makes the Worker's outgoing response
-  // framing inconsistent with the body bytes — on streaming responses
-  // this leaks chunk-size markers (e.g. `\r\n1000\r\n`) and bare `\n`
-  // buffer flushes into the SSE body, corrupting JSON payloads at 4KB
-  // boundaries. Observed with Ollama upstream.
-  const forwardHeaders = new Headers(upstream.headers);
-  forwardHeaders.delete("Transfer-Encoding");
-  forwardHeaders.delete("Content-Encoding");
-  forwardHeaders.delete("Content-Length");
-  forwardHeaders.delete("Connection");
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: forwardHeaders,
-  });
-}
-
-async function forwardModelsToUpstream(
-  upstreamBaseUrl: string,
-  apiKey: string
-): Promise<Response> {
-  let upstream: Response;
-
-  try {
-    upstream = await fetch(`${upstreamBaseUrl}${MODELS_PATH}`, {
-      method: "GET",
-      headers: upstreamAuthHeaders(upstreamBaseUrl, apiKey),
-    });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Network error reaching upstream";
-    return errorResponse(502, "upstream_error", `Provider unreachable: ${message}`);
-  }
-
-  if (!upstream.ok) {
-    await upstream.text();
-    return errorResponseWithUpstream(
-      502,
-      "upstream_error",
-      `Provider returned HTTP ${upstream.status} on /v1/models`,
-      upstream.status
-    );
-  }
-
-  const payload = await upstream.text();
-  return new Response(payload, {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -315,26 +243,4 @@ function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
-}
-
-function errorResponse(status: number, code: string, message: string): Response {
-  return new Response(JSON.stringify({ error: { code, message } }), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function errorResponseWithUpstream(
-  status: number,
-  code: string,
-  message: string,
-  upstreamStatus: number
-): Response {
-  return new Response(
-    JSON.stringify({ error: { code, message, upstream_status: upstreamStatus } }),
-    {
-      status,
-      headers: { "Content-Type": "application/json" },
-    }
-  );
 }

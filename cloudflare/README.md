@@ -38,18 +38,24 @@ id = "abc123..."   # <-- paste here
 
 **4. Set secrets**
 
+Choose which upstream(s) you want behind the Worker. Set the matching secrets:
+
 ```bash
+# Required
 npx wrangler secret put SOVBRAIN_PUBLIC_KEY    --config wrangler.toml
 npx wrangler secret put SOVBRAIN_USER_ID       --config wrangler.toml
-npx wrangler secret put PROVIDER_UPSTREAM_URL  --config wrangler.toml
-npx wrangler secret put PROVIDER_API_KEY       --config wrangler.toml
+
+# Multi-upstream — set whichever upstreams you want behind this Worker
+npx wrangler secret put ANTHROPIC_API_KEY      --config wrangler.toml   # optional
+npx wrangler secret put OPENAI_API_KEY         --config wrangler.toml   # optional
+npx wrangler secret put OLLAMA_URL             --config wrangler.toml   # optional
+npx wrangler secret put OLLAMA_API_KEY         --config wrangler.toml   # optional, Bearer token for hosted/gatewayed Ollama
+npx wrangler secret put DEFAULT_UPSTREAM       --config wrangler.toml   # optional, "anthropic"|"openai"|"ollama"
 ```
 
-Values:
-- `SOVBRAIN_PUBLIC_KEY` — base64 Ed25519 public key from sovBrain Settings → External AI
-- `SOVBRAIN_USER_ID` — your userId UUID from sovBrain Settings → External AI
-- `PROVIDER_UPSTREAM_URL` — e.g. `https://api.openai.com`
-- `PROVIDER_API_KEY` — your upstream provider API key (OpenAI / Anthropic / etc.)
+If you only have one upstream, you can skip `DEFAULT_UPSTREAM` — the Worker auto-routes unprefixed model names to the only configured upstream.
+
+Migrating from the old single-upstream config (`PROVIDER_UPSTREAM_URL` + `PROVIDER_API_KEY`)? Those secrets still work as a fallback if no multi-upstream var is set, but we recommend migrating to the per-upstream secrets so you can stack providers.
 
 **5. Deploy**
 
@@ -63,12 +69,19 @@ The output should say `Uploaded sovbrain-proxy` (not any other name). Note the U
 
 ## Environment variables / secrets
 
-| Name | Description |
-|------|-------------|
-| `SOVBRAIN_PUBLIC_KEY` | Base64 Ed25519 public key provided by sovBrain (Settings → External AI → "Your Signing Key") |
-| `SOVBRAIN_USER_ID` | Your sovBrain userId (UUID). Requests from other users are rejected. |
-| `PROVIDER_UPSTREAM_URL` | Base URL of your AI provider, e.g. `https://api.openai.com` (no trailing slash) |
-| `PROVIDER_API_KEY` | Your AI provider API key. Never leaves this Worker. |
+| Name | Required | Description |
+|------|----------|-------------|
+| `SOVBRAIN_PUBLIC_KEY` | Yes | Base64 Ed25519 public key from sovBrain Settings → External AI |
+| `SOVBRAIN_USER_ID` | Yes | Your sovBrain userId (UUID). Requests from other users are rejected. |
+| `ANTHROPIC_API_KEY` | Optional* | Your Anthropic API key (`sk-ant-...`). Worker translates OpenAI ↔ Anthropic Messages API automatically. |
+| `OPENAI_API_KEY` | Optional* | Your OpenAI API key (`sk-...`). |
+| `OLLAMA_URL` | Optional* | Base URL of your Ollama server (no trailing slash). |
+| `OLLAMA_API_KEY` | Optional | Bearer token sent to Ollama on every request. Set this when your Ollama is fronted by a gateway that requires auth (Ollama Cloud, Tailscale Funnel, custom reverse proxy). Omit for local/private Ollama with no auth. |
+| `DEFAULT_UPSTREAM` | Optional | `anthropic`, `openai`, or `ollama`. Routes unprefixed model names. Required only when multiple upstreams are configured. |
+| `PROVIDER_UPSTREAM_URL` | Legacy | Single-upstream fallback. Used only if no multi-upstream var is set. |
+| `PROVIDER_API_KEY` | Legacy | Single-upstream fallback API key. |
+
+*At least one upstream (Anthropic / OpenAI / Ollama) must be configured. The legacy vars count as a fallback configuration.
 
 ---
 
@@ -108,3 +121,27 @@ Plus one unsigned endpoint:
 - `GET /health` — liveness check, returns `ok`
 
 The Worker auto-detects upstream auth: Anthropic gets `x-api-key` + `anthropic-version`; everything else gets `Authorization: Bearer`.
+
+---
+
+## Upstream routing
+
+This Worker can serve up to three upstreams from a single URL: Anthropic, OpenAI, and Ollama. sovBrain's [Fetch models] returns the union with prefixed IDs (e.g. `anthropic:claude-haiku-4-5`, `ollama:qwen3:32b`). When sovBrain sends a chat completion, the Worker reads the model field's prefix and dispatches:
+
+| Prefix | Upstream | Behaviour |
+|--------|----------|-----------|
+| `anthropic:` | `https://api.anthropic.com/v1/messages` | Worker translates OpenAI chat-completions → Anthropic Messages and translates the streaming response back. PDFs not supported. |
+| `openai:` | `https://api.openai.com/v1/chat/completions` | Forwarded as-is. |
+| `ollama:` | `${OLLAMA_URL}/v1/chat/completions` | Forwarded as-is. Ollama is OpenAI-compatible at this endpoint. |
+
+Unprefixed model names route to `DEFAULT_UPSTREAM` if set. If only one upstream is configured, unprefixed names always work (no ambiguity). With multiple upstreams configured and no `DEFAULT_UPSTREAM`, unprefixed names return 400 `ambiguous_model`.
+
+Errors from upstreams include an `upstream_provider` field so sovBrain can tell you which provider failed.
+
+### Examples
+
+**Anthropic only**: set `ANTHROPIC_API_KEY`. Models discovery returns `anthropic:claude-haiku-4-5`, etc. sovBrain's existing single-upstream Settings configuration works unchanged.
+
+**Anthropic + Ollama**: set both `ANTHROPIC_API_KEY` and `OLLAMA_URL`. sovBrain's [Fetch models] returns the union. Pick `anthropic:claude-sonnet-4-5-20250929` for Sparring Partner, `ollama:qwen3:32b` for Scribe — both flow through the same Worker.
+
+**Migrating from legacy single-upstream**: your current `PROVIDER_UPSTREAM_URL` + `PROVIDER_API_KEY` keep working with no change. To stack a second upstream, just `wrangler secret put` the new one (e.g. `OLLAMA_URL`) and the Worker switches to multi-upstream mode automatically. Once switched, the legacy vars are ignored — clean them up with `wrangler secret delete`.
